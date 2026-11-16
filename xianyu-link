@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# ── xianyu-link v3 - INFO on : https://github.com/pierro78/xianyu-link
+# ── xianyu-link V3 - INFO on : https://github.com/pierro78/xianyu-link
 
 from urllib.parse import unquote
 from datetime import datetime
