@@ -1,0 +1,759 @@
+#!/usr/bin/env python3
+from urllib.parse import unquote
+from datetime import datetime
+from pathlib import Path
+import base64, io, json, os, re, subprocess, sys, shutil, tempfile, urllib.request
+
+PACKAGE = "com.taobao.idlefish"
+
+ITEM_ID_RE      = re.compile(r"fleamarket://awesome_detail\?itemId=(\d{9,})")
+ITEM_ID_RE_JSON = re.compile(r'"itemId"\s*:\s*"?(\d{9,})"?')
+SELLER_ID_RE    = re.compile(r'(?:userId|sellerId)[=:]\s*"?(\d{6,})"?')
+
+ITEM_BASE_URL   = "https://www.goofish.com/item?id="
+SELLER_BASE_URL = "https://www.goofish.com/personal?userId="
+
+SELLER_SIGNALS  = ("idle-personal-home", "Page_xySellerHome", "fleamarket://kun", "personal_home")
+
+LOG_FILE = Path.home() / ".local" / "share" / "xianyu-link" / "history.jsonl"
+SHOTS_DIR = LOG_FILE.parent / "shots"   # one unsplit screenshot per item: <item_id>.jpg
+TMP_DIR  = tempfile.gettempdir()   # /tmp on Linux, %TEMP% on Windows
+WINDOWS  = os.name == "nt"
+
+# ── Phone-specific settings (tuned for Huawei Mate 20 X, 720x1496) ───────────
+CROP_TOP         = 7     # % of screen height cut at the top (status bar)   — override: --top N
+CROP_BOTTOM      = 95    # % of screen height kept down to (nav buttons)     — override: --bottom N
+SCREENSHOT_DELAY = 3     # s between item detection and screen capture
+PAGE_LOAD_DELAY  = 1.5   # s to wait before reading the price from the screen
+SCREENSHOT_WIDTH = "40%" # imgcat width of the split screenshot (2 halves side by side)
+MAINPIC_WIDTH    = "20%" # imgcat width of the CDN fallback image
+SETTLE_DELAY     = 0.8   # --watch: s without new log lines before flushing an item
+
+
+def die(msg):
+    print(f"Error: {msg}", file=sys.stderr); sys.exit(1)
+
+
+def check_adb():
+    if not shutil.which("adb"):
+        die("adb not found in PATH")
+    r = subprocess.run(["adb", "devices"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    lines = [l for l in r.stdout.splitlines() if l.strip() and "List of" not in l]
+    if not [l for l in lines if "device" in l and "offline" not in l]:
+        die("No ADB device ready. Check cable and USB debugging.")
+
+
+DEVICE = None   # Android device name, set in main()
+
+
+def get_device_name():
+    """e.g. 'HUAWEI Mate 20 X (EVR-L29, Android 10)'."""
+    def prop(name):
+        r = subprocess.run(["adb", "shell", "getprop", name], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace")
+        return r.stdout.strip()
+    model  = prop("ro.product.model")
+    pretty = (prop("ro.config.marketing_name") or prop("ro.product.marketname")
+              or f"{prop('ro.product.brand')} {model}".strip())
+    return f"{pretty} ({model}, Android {prop('ro.build.version.release')})"
+
+
+def get_pid():
+    r = subprocess.run(["adb", "shell", f"pidof {PACKAGE}"],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    pid = r.stdout.strip().replace("\r", "")
+    if not pid:
+        die(f"{PACKAGE} not running. Open the app first.")
+    return pid.split()[0]
+
+
+def copy_to_clipboard(text):
+    if shutil.which("wl-copy"):
+        subprocess.run(["wl-copy", text], check=False); return "wl-copy"
+    if shutil.which("xclip"):
+        subprocess.run(["xclip", "-selection", "clipboard"],
+                       input=text.encode(), check=False); return "xclip"
+    if WINDOWS:
+        subprocess.run(["clip"], input=text.encode(), check=False)   # URLs are ASCII
+        return "clip"
+    return None
+
+
+def _field(pattern, text):
+    m = re.search(pattern, text)
+    return m.group(1) if m else None
+
+
+def extract_target(raw_line):
+    line = unquote(raw_line)
+
+    # --- Item ---
+    item_id = None
+    m = ITEM_ID_RE.search(line)
+    if m:
+        item_id = m.group(1)
+    elif "awesome_detail" in line:
+        m = ITEM_ID_RE_JSON.search(line)
+        if m:
+            item_id = m.group(1)
+
+    if item_id:
+        info = {"type": "item", "url": ITEM_BASE_URL + item_id, "item_id": item_id}
+
+        price = _field(r'"reserve_price"\s*:\s*"?([\d.]+)"?', line)
+        if price:
+            info["price"] = price.rstrip("0").rstrip(".")
+
+        ts_raw = _field(r'"publishTime"\s*:\s*"?(\d{10,13})"?', line)
+        if ts_raw:
+            ts = int(ts_raw)
+            if ts > 1e12: ts //= 1000
+            info["published"] = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+        seller_id = _field(r'"sellerId"\s*:\s*"(\d+)"', line)
+        if seller_id:
+            info["seller_url"] = SELLER_BASE_URL + seller_id
+
+        query = _field(r'"q"\s*:\s*"([^"]+)"', line)
+        if query:
+            info["query"] = query
+
+        idx = _field(r'"index"\s*:\s*"?(\d+)"?', line)
+        if idx:
+            info["index"] = idx
+
+        image = _field(r'"mainPic"\s*:\s*"([^"]+)"', line)
+        if image:
+            info["image"] = image
+
+        return info
+
+    # --- Seller ---
+    if any(sig in line for sig in SELLER_SIGNALS):
+        m = SELLER_ID_RE.search(line)
+        if m:
+            return {"type": "seller", "url": SELLER_BASE_URL + m.group(1), "user_id": m.group(1)}
+
+    return None
+
+
+def merge(base, new):
+    """Add fields from new into base without overwriting existing ones."""
+    for k, v in new.items():
+        if v is not None and k not in base:
+            base[k] = v
+
+
+def display(info, clip_tool=None, allow_screenshot=True):
+    kind = info["type"]
+    url  = info["url"]
+    clip_note = f"  → copied ({clip_tool})" if clip_tool else ""
+    info["seen_at"] = datetime.now().isoformat(timespec="seconds")
+    if DEVICE:
+        info["device"] = DEVICE
+
+    if kind == "item":
+        print(f"[item]   {url}{clip_note}", flush=True)
+        delay = SCREENSHOT_DELAY
+        if "price" not in info and allow_screenshot:
+            # Price is cut off from logcat (4 KB line limit) → read it from the screen
+            import time
+            t0 = time.monotonic()
+            time.sleep(PAGE_LOAD_DELAY)   # let the item page load
+            price, seller_kind = price_from_ui(info.get("item_id"))
+            if price:
+                info["price"] = price
+            if seller_kind:
+                info["seller_kind"] = seller_kind
+            delay = max(0, SCREENSHOT_DELAY - (time.monotonic() - t0))
+        print_details(info)
+        shot = show_image(info.get("image"), allow_screenshot, delay, info.get("item_id"))
+        if shot:
+            info["screenshot"] = shot
+    else:
+        print(f"[seller] {url}{clip_note}")
+        print_details(info)
+
+    print(flush=True)
+
+
+def print_details(info, device=False):
+    """Compact: 2 lines max under the URL.
+       ¥ 2339 (boutique) · published 2026-11-14 10:43 · captured 2026-11-16 22:20:21
+       seller https://…  · "matepad mini" #2  · HUAWEI Mate 20 X"""
+    a = []
+    if "price" in info:
+        a.append(f"¥ {info['price']}" + (f" ({info['seller_kind']})" if "seller_kind" in info else ""))
+    elif "seller_kind" in info:
+        a.append(f"({info['seller_kind']})")
+    if "published" in info: a.append(f"published {info['published']}")
+    if "seen_at"   in info: a.append(f"captured {info['seen_at'].replace('T', ' ')}")
+    b = []
+    if info.get("type") == "item" and "seller_url" in info:
+        b.append(f"seller {info['seller_url']}")
+    if "query" in info:
+        b.append(f"\"{info['query']}\"" + (f" #{info['index']}" if "index" in info else ""))
+    if device and "device" in info:
+        b.append(info["device"].split(" (")[0])
+    for parts in (a, b):
+        if parts:
+            print("         " + "  ·  ".join(parts))
+    sys.stdout.flush()
+
+
+def log_entry(info):
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    entry = {"seen_at": datetime.now().isoformat(timespec="seconds"), **info}
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _imgcat(path, width=MAINPIC_WIDTH):
+    if shutil.which("wezterm"):
+        subprocess.run(["wezterm", "imgcat", "--width", width, path], check=False)
+    else:
+        data = open(path, "rb").read()
+        b64  = base64.b64encode(data).decode()
+        sys.stdout.write(f"\033]1337;File=inline=1;width={width};preserveAspectRatio=1:{b64}\a\n")
+        sys.stdout.flush()
+
+
+def _split_halves(src):
+    """Split a portrait image in 2 equal halves placed side by side → temp jpg path."""
+    from PIL import Image
+    img = Image.open(src).convert("RGB")
+    cw, ch = img.size
+    half = ch // 2
+    gap  = 10
+    combined = Image.new("RGB", (cw * 2 + gap, half), (255, 255, 255))
+    combined.paste(img.crop((0, 0, cw, half)), (0, 0))
+    combined.paste(img.crop((0, half, cw, half * 2)), (cw + gap, 0))
+    out = os.path.join(TMP_DIR, "xianyu_sc_split.jpg")
+    combined.save(out, "JPEG", quality=85)
+    return out
+
+
+def _screenshot_crop(delay=SCREENSHOT_DELAY, item_id=None):
+    """Capture the phone screen, crop status/nav bars, save it (unsplit) → path."""
+    try:
+        import time; time.sleep(delay)
+        from PIL import Image
+        img = None
+        for attempt in range(3):
+            # Empty capture when the login popup (secure window) is on top → retry
+            r = subprocess.run(["adb", "exec-out", "screencap", "-p"],
+                               capture_output=True, timeout=10)
+            try:
+                img = Image.open(io.BytesIO(r.stdout)).convert("RGB")
+                break
+            except Exception:
+                time.sleep(1)
+        if img is None:
+            return None
+        w, h = img.size
+        cropped = img.crop((0, int(h * CROP_TOP / 100), w, int(h * CROP_BOTTOM / 100)))
+        if item_id:
+            SHOTS_DIR.mkdir(parents=True, exist_ok=True)
+            out = str(SHOTS_DIR / f"{item_id}.jpg")
+        else:
+            out = os.path.join(TMP_DIR, "xianyu_sc_crop.jpg")
+        cropped.save(out, "JPEG", quality=85)
+        return out
+    except Exception:
+        return None
+
+
+def show_mainpic(url):
+    try:
+        if url.startswith("//"):
+            url = "https:" + url
+        with urllib.request.urlopen(url, timeout=10) as r:
+            data = r.read()
+        from PIL import Image
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        img.thumbnail((800, 800))
+        tmp = os.path.join(TMP_DIR, "xianyu_mainpic.jpg")
+        img.save(tmp, "JPEG", quality=85)
+        _imgcat(tmp)
+    except Exception as e:
+        print(f"         (image download failed: {e})", file=sys.stderr)
+
+
+def show_image(url, allow_screenshot=True, delay=SCREENSHOT_DELAY, item_id=None):
+    """Display the item: phone screenshot split in 2 halves side by side.
+    Falls back to the CDN mainPic if the screen can't be captured (or already shows another page).
+    Returns the saved (unsplit) screenshot path, if any."""
+    if not sys.stdout.isatty():
+        return None
+    if allow_screenshot:
+        path = _screenshot_crop(delay, item_id)
+        if path:
+            try:
+                _imgcat(_split_halves(path), SCREENSHOT_WIDTH)
+            except Exception:
+                _imgcat(path, MAINPIC_WIDTH)
+            return path
+    if url:
+        show_mainpic(url)
+    return None
+
+
+def _load_history():
+    try:
+        with open(LOG_FILE, encoding="utf-8") as f:
+            return [json.loads(l) for l in f if l.strip()]
+    except FileNotFoundError:
+        die(f"no history yet ({LOG_FILE})")
+
+
+def show_entry(info, split, copy=True):
+    clip = copy_to_clipboard(info["url"]) if copy else None
+    clip_note = f"  → copied ({clip})" if clip else ""
+    print(f"[{info['type']}]".ljust(9) + f"{info['url']}{clip_note}")
+    print_details(info, device=True)
+    if info["type"] == "item":
+        shot = info.get("screenshot")
+        if not sys.stdout.isatty():
+            pass   # no inline images when piped
+        elif shot and os.path.exists(shot):
+            if split:
+                _imgcat(_split_halves(shot), SCREENSHOT_WIDTH)
+            else:
+                _imgcat(shot, MAINPIC_WIDTH)
+        elif info.get("image"):
+            print("         (no screenshot saved, showing CDN image)")
+            show_mainpic(info["image"])
+        else:
+            print("         (no screenshot saved for this entry)")
+    print(flush=True)
+
+
+def _human(n):
+    for unit in ("o", "Ko", "Mo", "Go"):
+        if n < 1024 or unit == "Go":
+            return f"{n:.0f} {unit}" if unit == "o" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def log_stats():
+    """→ 'N captures (I items, S sellers, P screenshots) — X Mo' for the startup banner."""
+    entries = []
+    if LOG_FILE.exists():
+        with open(LOG_FILE, encoding="utf-8") as f:
+            entries = [json.loads(l) for l in f if l.strip()]
+    shots = list(SHOTS_DIR.glob("*.jpg")) if SHOTS_DIR.exists() else []
+    size  = (LOG_FILE.stat().st_size if LOG_FILE.exists() else 0) + sum(p.stat().st_size for p in shots)
+    items = sum(1 for e in entries if e.get("type") == "item")
+    return (f"{len(entries)} captures ({items} items, {len(entries) - items} sellers, "
+            f"{len(shots)} screenshots) — {_human(size)} in {LOG_FILE.parent}")
+
+
+def purge(days=None, yes=False):
+    """Delete history entries (all, or older than `days`) and their unreferenced screenshots."""
+    from datetime import timedelta
+    entries = _load_history() if LOG_FILE.exists() else []
+    if days is None:
+        keep = []
+        what = "ALL history and screenshots"
+    else:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+        keep = [e for e in entries if e.get("seen_at", "") >= cutoff]
+        what = f"{len(entries) - len(keep)} entries older than {days} days (+ their screenshots)"
+    print(f"Before: {log_stats()}")
+    if not yes:
+        try:
+            if input(f"Delete {what}? [y/N] ").strip().lower() not in ("y", "yes", "o", "oui"):
+                print("Cancelled."); return
+        except EOFError:
+            print("Cancelled."); return
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
+        for e in keep:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    used = {os.path.abspath(e["screenshot"]) for e in keep if e.get("screenshot")}
+    if SHOTS_DIR.exists():
+        for shot in SHOTS_DIR.glob("*.jpg"):
+            if os.path.abspath(shot) not in used:
+                shot.unlink()
+    print(f"After:  {log_stats()}")
+
+
+PURGE_HINT = ("To delete logs: xianyu-link --purge (everything)  |  "
+              "xianyu-link --purge-older 30 (entries older than 30 days)")
+
+
+def _read_key():
+    """One keypress → 'up' / 'down' / 'left' / 'right' / a plain character."""
+    if WINDOWS:
+        import msvcrt
+        c = msvcrt.getwch()
+        if c in ("\x00", "\xe0"):
+            return {"H": "up", "P": "down", "K": "left", "M": "right"}.get(msvcrt.getwch(), "")
+        return c
+    import termios, tty
+    fd  = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        c = os.read(fd, 1).decode(errors="ignore")
+        if c == "\x1b":
+            seq = os.read(fd, 2).decode(errors="ignore")
+            return {"[A": "up", "[B": "down", "[D": "left", "[C": "right"}.get(seq, "esc")
+        return c
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def show_last(n, split):
+    """--last N: browse history starting at the Nth most recent entry (0 = latest).
+    ↑ = older (N+1), ↓ = newer (N-1), s = split on/off, q = quit.
+    In split mode, 2 entries are shown (N, then N+1 below); the URL copied is N's."""
+    entries = _load_history()
+    if not 0 <= n < len(entries):
+        die(f"--last must be between 0 and {len(entries) - 1}")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        show_entry(entries[-1 - n], split)
+        return
+    try:
+        while True:
+            sys.stdout.write("\033[2J\033[3J\033[H")   # clear screen + scrollback
+            pair = split and n + 1 < len(entries)
+            label = f"--last {n}" + (f" + {n + 1}" if pair else "")
+            print(f"{label}   ({n + 1}/{len(entries)})\n")
+            show_entry(entries[-1 - n], split)
+            if pair:
+                print("─" * 60 + f"  --last {n + 1}\n")
+                show_entry(entries[-2 - n], split, copy=False)
+            print(f"↑ older   ↓ newer   s split {'off' if split else 'on'}   q quit", flush=True)
+            while True:
+                k = _read_key()
+                if k in ("q", "Q", "esc", "\x1b", "\x03"):   # \x1b = Esc on Windows (msvcrt)
+                    return
+                if k == "up" and n < len(entries) - 1:
+                    n += 1; break
+                if k == "down" and n > 0:
+                    n -= 1; break
+                if k in ("s", "S"):
+                    split = not split; break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print()
+
+
+_notif = {"id": None, "t": 0.0}
+NOTIFY_MIN_INTERVAL = 2   # s between desktop notifications (KDE rate-limits bursts)
+
+
+def notify(info):
+    """Desktop notification. Replaces the previous one (-r) instead of stacking,
+    throttled, and silent on errors (KDE: ExcessNotificationGeneration)."""
+    import time
+    if not shutil.which("notify-send"):
+        return
+    now = time.monotonic()
+    if now - _notif["t"] < NOTIFY_MIN_INTERVAL:
+        return
+    _notif["t"] = now
+    if info["type"] == "item":
+        title = "Xianyu — item"
+        body  = ("¥" + info["price"] + " — " if "price" in info else "") + info["url"]
+    else:
+        title = "Xianyu — seller"
+        body  = info["url"]
+    cmd = ["notify-send", "-t", "5000", "-p", "-a", "xianyu-link", title, body]
+    if _notif["id"]:
+        cmd[1:1] = ["-r", _notif["id"]]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        nid = r.stdout.strip()
+        if nid.isdigit():
+            _notif["id"] = nid
+    except Exception:
+        pass
+
+
+PRICE_UI_RE = re.compile(r'[¥￥] ?(\d[\d,]*(?:\.\d+)?)')
+
+
+def _roller_price(tokens):
+    """Main price is an animated digit roller: '¥|2|3|3|4|3|4|9|0' = each digit followed
+    by its successor (2→3, 3→4, 3→4, 9→0) → 2339. Fall back to plain concatenation."""
+    digits = [t for t in tokens if t.isdigit()]
+    paired = (len(digits) % 2 == 0 and digits and
+              all(int(digits[i + 1]) == (int(digits[i]) + 1) % 10
+                  for i in range(0, len(digits), 2)))
+    out, i = "", 0
+    while i < len(tokens):
+        t = tokens[i]
+        out += t
+        i += 2 if (paired and t.isdigit()) else 1
+    return out or None
+
+
+LOGIN_MARKERS = ("欢迎来到闲鱼", "支付宝登录")
+SHOP_MARKERS  = ("共卖出", "严选", "专营", "旗舰店", "专卖店")
+
+
+_last_page = {"item_id": None, "fp": None}   # fingerprint of the last item page read
+_dump_fp   = None                              # fingerprint of the latest dump
+
+
+def price_from_ui(item_id=None, tries=4):
+    """Read (price, seller kind) from the screen.
+    Retries if the login popup covers the item, or if the screen still shows the
+    previous item's page (same fingerprint) → never returns the previous item's price."""
+    import time
+    for attempt in range(tries):
+        price, login, kind = _price_from_ui_once()
+        stale = (item_id and _dump_fp and _last_page["fp"] == _dump_fp
+                 and _last_page["item_id"] != item_id)
+        if price and not stale:
+            _last_page.update(item_id=item_id, fp=_dump_fp)
+            return price, kind
+        if attempt < tries - 1:
+            time.sleep(1)
+    if stale:
+        print("         (screen still shows the previous item — price skipped)", file=sys.stderr)
+    return None, None
+
+
+def _price_from_ui_once():
+    """One uiautomator dump → (price, login_screen_shown, seller_kind)."""
+    try:
+        subprocess.run(["adb", "shell", "uiautomator", "dump", "/sdcard/ui.xml"],
+                       capture_output=True, timeout=8)
+        r = subprocess.run(["adb", "shell", "cat", "/sdcard/ui.xml"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
+    except Exception:
+        return None, False, None
+    login = any(m in r.stdout for m in LOGIN_MARKERS)
+    kind  = "boutique" if any(m in r.stdout for m in SHOP_MARKERS) else None
+    descs = [d.replace("&#10;", "\n").replace("\u200b", "")
+             for d in re.findall(r'(?:text|content-desc)="([^"]*)"', r.stdout)]
+    # Page fingerprint = longest text on screen (item title/description)
+    global _dump_fp
+    _dump_fp = max(descs, key=len) if descs and not login else None
+
+    def clean(p):
+        p = p.replace(",", "")
+        return p.rstrip("0").rstrip(".") if "." in p else p
+
+    # 1) Personal listings: '现价1500 , ¥|1500'
+    for d in descs:
+        m = re.search(r'现价\s*(\d[\d,]*(?:\.\d+)?)', d)
+        if m:
+            return clean(m.group(1)), login, kind or "particulier"
+
+    # 2) Shop listings: big animated roller '¥|2|3|3|4|3|4|9|0' (one digit per line)
+    for d in descs:
+        lines = [l.strip() for l in d.split("\n")]
+        if "¥" in lines or "￥" in lines:
+            i = lines.index("¥") if "¥" in lines else lines.index("￥")
+            tokens = []
+            for l in lines[i + 1:]:
+                if len(l) == 1 and (l.isdigit() or l == "."):
+                    tokens.append(l)
+                else:
+                    break
+            p = _roller_price(tokens)
+            if p:
+                return clean(p), login, "boutique"
+
+    # 3) Fallback: first '¥123' in page order (skip discounts)
+    for d in descs:
+        if "优惠" in d or "抵" in d:
+            continue
+        m = PRICE_UI_RE.search(d)
+        if m:
+            return clean(m.group(1)), login, kind
+    return None, login, kind
+
+
+def get_target_from_ui():
+    subprocess.run(["adb", "shell", "uiautomator", "dump", "/sdcard/ui.xml"], capture_output=True)
+    r = subprocess.run(["adb", "shell", "cat", "/sdcard/ui.xml"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    for c in re.findall(r'(?:text|content-desc)="(\d{10,15})"', r.stdout):
+        if not c.startswith("17"):
+            return {"type": "item", "url": ITEM_BASE_URL + c, "item_id": c}
+    return None
+
+
+def get_current_target():
+    pid = get_pid()
+    r = subprocess.run(
+        ["adb", "logcat", "-d", "-t", "10000", "-s", "x-n-x", f"--pid={pid}"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    # Scan newest→oldest, merge all lines for the same item to get richest data
+    best = None
+    for line in reversed(r.stdout.splitlines()):
+        result = extract_target(line)
+        if not result:
+            continue
+        if best is None:
+            best = result
+        elif result.get("item_id") == best.get("item_id"):
+            merge(best, result)
+        else:
+            break  # different item, stop
+    if best:
+        return best
+    print("Logcat buffer empty, trying UI dump...", file=sys.stderr)
+    result = get_target_from_ui()
+    if result:
+        return result
+    die("Nothing found. Use --watch: start it first, then open an article or seller page.")
+
+
+def watch_mode():
+    import threading, queue, time
+    pid = get_pid()
+    print(f"Device:  {DEVICE}")
+    print(f"Logs:    {log_stats()}")
+    print(f"         {PURGE_HINT}")
+    print("\nWatching for Xianyu items & sellers (Ctrl+C to stop)...\n", flush=True)
+    seen    = set()
+    pending = {}   # item_id -> [info, last_update_time]
+    SETTLE  = SETTLE_DELAY
+
+    def flush(info, allow_screenshot=True):
+        url = info["url"]
+        if url in seen:
+            return
+        seen.add(url)
+        clip = copy_to_clipboard(url)
+        display(info, clip, allow_screenshot)
+        log_entry(info)
+        notify(info)
+
+    def flush_all(allow_screenshot=True):
+        for info, _ in list(pending.values()):
+            flush(info, allow_screenshot)
+        pending.clear()
+
+    # Start reading at the phone's current time: without -T, logcat first replays its
+    # whole buffer and the last item of the previous session shows up again.
+    r = subprocess.run(["adb", "shell", "date '+%m-%d %H:%M:%S.000'"],   # one string: adb shell re-splits args
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    since = r.stdout.strip()
+    since_args = ["-T", since] if re.fullmatch(r"\d\d-\d\d \d\d:\d\d:\d\d\.000", since) else ["-T", "1"]
+    proc = subprocess.Popen(
+        ["adb", "logcat", *since_args, "-s", "x-n-x", f"--pid={pid}"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
+
+    lines = queue.Queue()
+    def reader():
+        for l in proc.stdout:
+            lines.put(l)
+        lines.put(None)
+    threading.Thread(target=reader, daemon=True).start()
+
+    try:
+        while True:
+            try:
+                line = lines.get(timeout=0.2)
+            except queue.Empty:
+                line = ""
+            if line is None:
+                break
+
+            # Flush items whose log lines have settled (screen still shows them)
+            now = time.monotonic()
+            for iid, (info, t) in list(pending.items()):
+                if now - t >= SETTLE:
+                    del pending[iid]
+                    flush(info)
+
+            if not line:
+                continue
+            # endEvent = leaving a page (it carries the item we're leaving): never a new capture
+            if "endEvent" in line:
+                continue
+            result = extract_target(line)
+            if not result:
+                continue
+
+            kind = result["type"]
+            url  = result["url"]
+
+            if url in seen:
+                continue
+
+            if kind == "seller":
+                # Screen already moved on: no screenshot for leftover items
+                flush_all(allow_screenshot=False)
+                flush(result)
+                continue
+
+            item_id = result["item_id"]
+            if item_id in pending:
+                merge(pending[item_id][0], result)
+                pending[item_id][1] = time.monotonic()
+            else:
+                # Screen already shows the new item: no screenshot for older ones
+                flush_all(allow_screenshot=False)
+                pending[item_id] = [result, time.monotonic()]
+
+            # Rich data (price or CDN image) → flush immediately
+            info = pending[item_id][0]
+            if "price" in info or "image" in info:
+                del pending[item_id]
+                flush(info)
+
+    except KeyboardInterrupt:
+        flush_all(allow_screenshot=False)
+        proc.terminate()
+        print("\nStopped.")
+
+
+def main():
+    import argparse
+    if WINDOWS:
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+    global CROP_TOP, CROP_BOTTOM
+    ap = argparse.ArgumentParser(description="Extract Xianyu item/seller URLs via ADB.")
+    ap.add_argument("-w", "--watch", action="store_true", help="watch continuously")
+    ap.add_argument("--last", type=int, metavar="N",
+                    help="browse history from the Nth most recent entry (0 = latest): ↑ older, ↓ newer, s split, q quit")
+    ap.add_argument("--splitted", "--split", action="store_true",
+                    help="with --last: show the screenshot split in 2 halves side by side")
+    ap.add_argument("--purge", action="store_true",
+                    help="delete ALL history and screenshots (asks for confirmation)")
+    ap.add_argument("--purge-older", type=float, metavar="DAYS",
+                    help="delete history entries (and screenshots) older than DAYS days")
+    ap.add_argument("-y", "--yes", action="store_true", help="with --purge*: don't ask for confirmation")
+    ap.add_argument("--top", type=float, default=CROP_TOP,
+                    help=f"screenshot crop: start at N%% of height (default {CROP_TOP})")
+    ap.add_argument("--bottom", type=float, default=CROP_BOTTOM,
+                    help=f"screenshot crop: stop at N%% of height (default {CROP_BOTTOM})")
+    args = ap.parse_args()
+    if not 0 <= args.top < args.bottom <= 100:
+        die("need 0 <= --top < --bottom <= 100")
+    CROP_TOP, CROP_BOTTOM = args.top, args.bottom
+
+    if args.purge or args.purge_older is not None:
+        purge(None if args.purge else args.purge_older, args.yes)
+        return
+    if args.last is not None:
+        show_last(args.last, args.splitted)
+        return
+
+    global DEVICE
+    check_adb()
+    DEVICE = get_device_name()
+    if args.watch:
+        watch_mode()
+    else:
+        info = get_current_target()
+        clip = copy_to_clipboard(info["url"])
+        display(info, clip)
+        log_entry(info)
+        notify(info)
+
+
+if __name__ == "__main__":
+    main()
