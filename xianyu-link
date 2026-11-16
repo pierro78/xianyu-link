@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# ── INFO on : https://github.com/pierro78/xianyu-link
+
 from urllib.parse import unquote
 from datetime import datetime
 from pathlib import Path
