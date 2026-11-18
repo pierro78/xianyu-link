@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# ── xianyu-link V3 - INFO on : https://github.com/pierro78/xianyu-link
+# ── xianyu-link V3.1 - INFO on : https://github.com/pierro78/xianyu-link
 
 from urllib.parse import unquote
 from datetime import datetime
@@ -76,6 +76,10 @@ def copy_to_clipboard(text):
     if shutil.which("xclip"):
         subprocess.run(["xclip", "-selection", "clipboard"],
                        input=text.encode(), check=False); return "xclip"
+    if shutil.which("pbcopy"):   # macOS
+        subprocess.run(["pbcopy"], input=text.encode(), check=False); return "pbcopy"
+
+
     if WINDOWS:
         subprocess.run(["clip"], input=text.encode(), check=False)   # URLs are ASCII
         return "clip"
