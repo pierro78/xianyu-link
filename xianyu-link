@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# ── xianyu-link V3.1 - INFO on : https://github.com/pierro78/xianyu-link
+# ── xianyu-link V3.2 - INFO on : https://github.com/pierro78/xianyu-link
 
 from urllib.parse import unquote
 from datetime import datetime
@@ -149,6 +149,43 @@ def merge(base, new):
             base[k] = v
 
 
+# --watch sets this: True once the logs show the user has left the item being processed
+moved_on = lambda: False
+
+
+def _wait(seconds):
+    """Sleep, but stop early if the user moved to another page → True if moved on."""
+    import time
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if moved_on():
+            return True
+        time.sleep(0.2)
+    return moved_on()
+
+
+_seller_kinds = None   # seller URL → 'boutique'/'particulier', from seller pages (more reliable)
+
+
+def seller_kinds():
+    """Seller types already read on their profile page (history + this session)."""
+    global _seller_kinds
+    if _seller_kinds is None:
+        _seller_kinds = {}
+        try:
+            with open(LOG_FILE, encoding="utf-8") as f:
+                for l in f:
+                    e = json.loads(l)
+                    k = e.get("seller_kind")
+                    if e.get("type") == "seller" and k:
+                        if not e.get("shop_badge") and not k.endswith("?"):
+                            k += "?"   # older entries: no proof recorded → a guess
+                        _seller_kinds[e["url"]] = k
+        except (FileNotFoundError, ValueError):
+            pass
+    return _seller_kinds
+
+
 def display(info, clip_tool=None, allow_screenshot=True):
     kind = info["type"]
     url  = info["url"]
@@ -164,22 +201,73 @@ def display(info, clip_tool=None, allow_screenshot=True):
             # Price is cut off from logcat (4 KB line limit) → read it from the screen
             import time
             t0 = time.monotonic()
-            time.sleep(PAGE_LOAD_DELAY)   # let the item page load
-            price, seller_kind = price_from_ui(info.get("item_id"))
+            if _wait(PAGE_LOAD_DELAY):   # let the item page load (unless already left)
+                price, seller_kind = None, None
+            else:
+                price, seller_kind = price_from_ui(info.get("item_id"))
             if price:
                 info["price"] = price
             if seller_kind:
                 info["seller_kind"] = seller_kind
             delay = max(0, SCREENSHOT_DELAY - (time.monotonic() - t0))
+        if info.get("seller_url") in seller_kinds():
+            # the seller's profile page already told us (e.g. 持证经营 = licensed business)
+            info["seller_kind"] = seller_kinds()[info["seller_url"]]
+        if moved_on():
+            allow_screenshot = False   # screen already shows another page
+            print("         (left the item before capture — no price/screenshot)")
         print_details(info)
         shot = show_image(info.get("image"), allow_screenshot, delay, info.get("item_id"))
         if shot:
             info["screenshot"] = shot
     else:
-        print(f"[seller] {url}{clip_note}")
+        print(f"[seller] {url}{clip_note}", flush=True)
+        import time
+        t0 = time.monotonic()
+        if allow_screenshot and not _wait(PAGE_LOAD_DELAY):
+            merge(info, seller_from_ui())
+            if info.get("seller_kind"):
+                seller_kinds()[url] = info["seller_kind"]
+        delay = max(0, SCREENSHOT_DELAY - (time.monotonic() - t0))
+        if moved_on():
+            allow_screenshot = False
+            print("         (left the seller before capture — no profile/screenshot)")
         print_details(info)
+        shot = show_image(None, allow_screenshot, delay, f"seller_{info.get('user_id')}")
+        if shot:
+            info["screenshot"] = shot
 
     print(flush=True)
+
+
+PROVINCES = {   # IP location shown on Xianyu profiles → English
+    "北京": "Beijing", "天津": "Tianjin", "上海": "Shanghai", "重庆": "Chongqing",
+    "河北": "Hebei", "山西": "Shanxi", "辽宁": "Liaoning", "吉林": "Jilin",
+    "黑龙江": "Heilongjiang", "江苏": "Jiangsu", "浙江": "Zhejiang", "安徽": "Anhui",
+    "福建": "Fujian", "江西": "Jiangxi", "山东": "Shandong", "河南": "Henan",
+    "湖北": "Hubei", "湖南": "Hunan", "广东": "Guangdong", "海南": "Hainan",
+    "四川": "Sichuan", "贵州": "Guizhou", "云南": "Yunnan", "陕西": "Shaanxi",
+    "甘肃": "Gansu", "青海": "Qinghai", "台湾": "Taiwan", "内蒙古": "Inner Mongolia",
+    "广西": "Guangxi", "西藏": "Tibet", "宁夏": "Ningxia", "新疆": "Xinjiang",
+    "香港": "Hong Kong", "澳门": "Macau",
+}
+
+
+def _province(t):
+    """'四川省' → 'Sichuan' (unknown, e.g. a foreign country → unchanged)."""
+    return next((en for zh, en in PROVINCES.items() if t.startswith(zh)), t)
+
+
+def _ago(t):
+    """'10小时前' → '10h ago', '3天前' → '3d ago', '刚刚' → 'just now' (else unchanged)."""
+    if t.startswith("刚刚"):
+        return "just now"
+    m = re.fullmatch(r"(\d+)\s*(秒|分钟|小时|天|周|个月|月|年)前", t)
+    if not m:
+        return t
+    unit = {"秒": "s", "分钟": "min", "小时": "h", "天": "d", "周": "w",
+            "个月": " months", "月": " months", "年": "y"}[m.group(2)]
+    return f"{m.group(1)}{unit} ago"
 
 
 def print_details(info, device=False):
@@ -190,10 +278,21 @@ def print_details(info, device=False):
     if "price" in info:
         a.append(f"¥ {info['price']}" + (f" ({info['seller_kind']})" if "seller_kind" in info else ""))
     elif "seller_kind" in info:
-        a.append(f"({info['seller_kind']})")
+        a.append(f"({info['seller_kind']}" + (f": {info['shop_badge']}" if "shop_badge" in info else "") + ")")
+    if "positive"  in info: a.append(f"positive {info['positive']}")
+    if "on_sale"   in info: a.append(f"on sale {info['on_sale']}")
+    elif "items"   in info: a.append(f"{info['items']} items")
+    if "sold"      in info: a.append(f"sold (shown) {info['sold']}")
+    if "credit"    in info: a.append(f"credit {info['credit']}")
+    if "reviews"   in info: a.append(f"reviews {info['reviews']}")
     if "published" in info: a.append(f"published {info['published']}")
     if "seen_at"   in info: a.append(f"captured {info['seen_at'].replace('T', ' ')}")
     b = []
+    if "name"      in info: b.append(f"name {info['name']}")
+    if "ip"        in info: b.append(f"IP {_province(info['ip'])}")
+    if "last_seen" in info: b.append(f"last online {_ago(info['last_seen'])}")
+    if "fans"      in info: b.append(f"{info['fans']} fans")
+    if "kudos"     in info: b.append(f"{info['kudos']} kudos")
     if info.get("type") == "item" and "seller_url" in info:
         b.append(f"seller {info['seller_url']}")
     if "query" in info:
@@ -241,7 +340,8 @@ def _split_halves(src):
 def _screenshot_crop(delay=SCREENSHOT_DELAY, item_id=None):
     """Capture the phone screen, crop status/nav bars, save it (unsplit) → path."""
     try:
-        import time; time.sleep(delay)
+        if _wait(delay):
+            return None   # user left the item: don't capture the next page
         from PIL import Image
         img = None
         for attempt in range(3):
@@ -252,7 +352,8 @@ def _screenshot_crop(delay=SCREENSHOT_DELAY, item_id=None):
                 img = Image.open(io.BytesIO(r.stdout)).convert("RGB")
                 break
             except Exception:
-                time.sleep(1)
+                if _wait(1):
+                    return None
         if img is None:
             return None
         w, h = img.size
@@ -316,8 +417,10 @@ def show_entry(info, split, copy=True):
     clip_note = f"  → copied ({clip})" if clip else ""
     print(f"[{info['type']}]".ljust(9) + f"{info['url']}{clip_note}")
     print_details(info, device=True)
+    shot = info.get("screenshot")
+    if info["type"] == "seller" and shot and os.path.exists(shot) and sys.stdout.isatty():
+        _imgcat(_split_halves(shot), SCREENSHOT_WIDTH) if split else _imgcat(shot, MAINPIC_WIDTH)
     if info["type"] == "item":
-        shot = info.get("screenshot")
         if not sys.stdout.isatty():
             pass   # no inline images when piped
         elif shot and os.path.exists(shot):
@@ -464,8 +567,8 @@ def notify(info):
         title = "Xianyu — item"
         body  = ("¥" + info["price"] + " — " if "price" in info else "") + info["url"]
     else:
-        title = "Xianyu — seller"
-        body  = info["url"]
+        title = "Xianyu — seller" + (f" ({info['seller_kind']})" if "seller_kind" in info else "")
+        body  = (f"sold (shown) {info['sold']} — " if "sold" in info else "") + info["url"]
     cmd = ["notify-send", "-t", "5000", "-p", "-a", "xianyu-link", title, body]
     if _notif["id"]:
         cmd[1:1] = ["-r", _notif["id"]]
@@ -516,8 +619,8 @@ def price_from_ui(item_id=None, tries=4):
         if price and not stale:
             _last_page.update(item_id=item_id, fp=_dump_fp)
             return price, kind
-        if attempt < tries - 1:
-            time.sleep(1)
+        if attempt < tries - 1 and _wait(1):
+            return None, None
     if stale:
         print("         (screen still shows the previous item — price skipped)", file=sys.stderr)
     return None, None
@@ -533,7 +636,8 @@ def _price_from_ui_once():
     except Exception:
         return None, False, None
     login = any(m in r.stdout for m in LOGIN_MARKERS)
-    kind  = "boutique" if any(m in r.stdout for m in SHOP_MARKERS) else None
+    # Item page = guess only ('?'): markers may come from the recommendations below
+    kind  = "boutique?" if any(m in r.stdout for m in SHOP_MARKERS) else None
     descs = [d.replace("&#10;", "\n").replace("\u200b", "")
              for d in re.findall(r'(?:text|content-desc)="([^"]*)"', r.stdout)]
     # Page fingerprint = longest text on screen (item title/description)
@@ -548,7 +652,7 @@ def _price_from_ui_once():
     for d in descs:
         m = re.search(r'现价\s*(\d[\d,]*(?:\.\d+)?)', d)
         if m:
-            return clean(m.group(1)), login, kind or "particulier"
+            return clean(m.group(1)), login, kind or "particulier?"
 
     # 2) Shop listings: big animated roller '¥|2|3|3|4|3|4|9|0' (one digit per line)
     for d in descs:
@@ -563,7 +667,7 @@ def _price_from_ui_once():
                     break
             p = _roller_price(tokens)
             if p:
-                return clean(p), login, "boutique"
+                return clean(p), login, "boutique?"
 
     # 3) Fallback: first '¥123' in page order (skip discounts)
     for d in descs:
@@ -573,6 +677,96 @@ def _price_from_ui_once():
         if m:
             return clean(m.group(1)), login, kind
     return None, login, kind
+
+
+def _ui_texts():
+    """One uiautomator dump → (list of texts/content-desc, raw xml)."""
+    import html
+    try:
+        subprocess.run(["adb", "shell", "uiautomator", "dump", "/sdcard/ui.xml"],
+                       capture_output=True, timeout=8)
+        r = subprocess.run(["adb", "shell", "cat", "/sdcard/ui.xml"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
+    except Exception:
+        return [], ""
+    texts = [html.unescape(d).replace("\u200b", "").strip()
+             for d in re.findall(r'(?:text|content-desc)="([^"]*)"', r.stdout)]
+    return [t for t in texts if t], r.stdout
+
+
+def _parse_seller(texts, raw):
+    """Seller home page → profile fields. Tabs/counters look like '已售出\n25', '318\n宝贝'."""
+    info = {}
+    for i, t in enumerate(texts):
+        parts = [x.strip() for x in t.split("\n")]
+        if len(parts) == 2:
+            a, b = parts
+            if a == "已售出" and b.isdigit(): info["sold"] = b
+            if a == "在售"   and b.isdigit(): info["on_sale"] = b
+            if b == "评价"   and a:          info["reviews"] = a
+            if b == "宝贝"   and a.isdigit(): info["items"] = a
+        m = re.fullmatch(r"(.{1,12}?)来过", t)            # '8小时前来过', '刚刚来过'
+        if m and "last_seen" not in info:
+            info["last_seen"] = m.group(1)
+            if i > 0 and len(texts[i - 1]) <= 30:
+                info["name"] = texts[i - 1]                # nickname is right above
+        m = re.fullmatch(r"IP\s*(\S+)", t)
+        if m: info["ip"] = m.group(1)
+        m = (re.search(r"好评率\D{0,3}(\d+(?:\.\d+)?%)", t)
+             or re.search(r"(\d+(?:\.\d+)?%)\s*好评", t))
+        if m: info["positive"] = m.group(1)
+        m = re.fullmatch(r"共获得(\d+)次夸夸", t)
+        if m: info["kudos"] = m.group(1)
+    # Credit record: values first, then their labels in the same order, e.g.
+    #   '较差', '96', '卖家信用', '%', '卖家好评'      → credit 较差, positive 96%
+    #   '初出茅庐', '萌新小白', '夸夸Ta', '卖家信用', '买家信用' → seller / buyer credit
+    #   '极好', '极好', '97', '卖家信用', '买家信用', '%', '好评率'  → credit 极好, positive 97%
+    LABELS = {"卖家信用": "credit", "买家信用": "buyer_credit", "卖家好评": "positive", "好评率": "positive"}
+    first = next((i for i, t in enumerate(texts) if t in LABELS), None)
+    if first is not None:
+        labels = []
+        for t in texts[first:first + 6]:
+            if t in LABELS: labels.append(LABELS[t])
+            elif t != "%": break
+        values = [t for t in texts[max(0, first - 6):first]
+                  if "夸夸" not in t and len(t) <= 8][-len(labels):]
+        for key, val in zip(labels, values):
+            if key == "positive":
+                if re.fullmatch(r"\d+(?:\.\d+)?", val) and "positive" not in info:
+                    info["positive"] = val + "%"
+            elif not re.fullmatch(r"[\d.%]+", val):
+                info[key] = val
+    # '粉丝', '关注', '15', '1' → labels first, then the numbers in the same order
+    if "粉丝" in texts:
+        i = texts.index("粉丝")
+        nums = [t for t in texts[i + 1:i + 6] if re.fullmatch(r"[\d.]+[万w]?\+?", t)]
+        if nums:
+            info["fans"] = nums[0]
+    if info:
+        # Sure ('boutique') only if a shop badge is a text of its own in the profile header
+        # (above 信用档案, so not in the bio or the listings); otherwise it's a guess ('?').
+        shop = SHOP_MARKERS + ("店铺", "持证经营", "优质商家")   # licensed / recommended merchant
+        end = texts.index("信用档案") if "信用档案" in texts else len(texts)
+        badges = [t for t in texts[:end] if t.lstrip("·") in shop]
+        if badges:
+            info["seller_kind"] = "boutique"
+            info["shop_badge"] = badges[0].lstrip("·")
+        elif any(m in raw for m in shop):
+            info["seller_kind"] = "boutique?"
+        else:
+            info["seller_kind"] = "particulier?"
+    return info
+
+
+def seller_from_ui(tries=4):
+    """Read the seller's profile from the screen, waiting for the page to load."""
+    for attempt in range(tries):
+        texts, raw = _ui_texts()
+        if not any(m in raw for m in LOGIN_MARKERS) and ("已售出" in raw or "宝贝" in raw):
+            return _parse_seller(texts, raw)
+        if attempt < tries - 1 and _wait(1):
+            break
+    return {}
 
 
 def get_target_from_ui():
@@ -617,17 +811,23 @@ def watch_mode():
     print(f"Logs:    {log_stats()}")
     print(f"         {PURGE_HINT}")
     print("\nWatching for Xianyu items & sellers (Ctrl+C to stop)...\n", flush=True)
-    seen    = set()
+    seen    = set()   # items already shown this session
+    last    = {"url": None}   # page of the previous log line (sellers: shown again when revisited)
     pending = {}   # item_id -> [info, last_update_time]
     SETTLE  = SETTLE_DELAY
 
     def flush(info, allow_screenshot=True):
         url = info["url"]
-        if url in seen:
-            return
-        seen.add(url)
+        if info["type"] == "item":
+            if url in seen:
+                return
+            seen.add(url)
         clip = copy_to_clipboard(url)
-        display(info, clip, allow_screenshot)
+        current["url"] = url
+        try:
+            display(info, clip, allow_screenshot)
+        finally:
+            current["url"] = None
         log_entry(info)
         notify(info)
 
@@ -643,7 +843,7 @@ def watch_mode():
     since = r.stdout.strip()
     since_args = ["-T", since] if re.fullmatch(r"\d\d-\d\d \d\d:\d\d:\d\d\.000", since) else ["-T", "1"]
     proc = subprocess.Popen(
-        ["adb", "logcat", *since_args, "-s", "x-n-x", f"--pid={pid}"],
+        ["adb", "logcat", *since_args, "-s", "x-n-x"],   # no --pid: keeps working if Xianyu restarts
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
 
     lines = queue.Queue()
@@ -653,10 +853,36 @@ def watch_mode():
         lines.put(None)
     threading.Thread(target=reader, daemon=True).start()
 
+    # While an item is being processed (price read, screenshot delay), peek at the new
+    # log lines: if they show another item/seller, the screen has moved on.
+    from collections import deque
+    backlog = deque()
+    current = {"url": None}
+    def _moved_on():
+        while True:
+            try:
+                backlog.append(lines.get_nowait())
+            except queue.Empty:
+                break
+        for l in backlog:
+            if l is None or not current["url"]:
+                continue
+            if "endEvent" in l:
+                # endEvent = leaving a page: leaving *this* item (e.g. back to the results)
+                if extract_target(l) and extract_target(l)["url"] == current["url"]:
+                    return True
+                continue
+            r = extract_target(l)
+            if r and r["url"] != current["url"]:
+                return True
+        return False
+    global moved_on
+    moved_on = _moved_on
+
     try:
         while True:
             try:
-                line = lines.get(timeout=0.2)
+                line = backlog.popleft() if backlog else lines.get(timeout=0.2)
             except queue.Empty:
                 line = ""
             if line is None:
@@ -680,9 +906,12 @@ def watch_mode():
 
             kind = result["type"]
             url  = result["url"]
+            prev, last["url"] = last["url"], url
 
-            if url in seen:
+            if kind == "item" and url in seen:
                 continue
+            if kind == "seller" and url == prev:
+                continue   # still on the same seller page
 
             if kind == "seller":
                 # Screen already moved on: no screenshot for leftover items
