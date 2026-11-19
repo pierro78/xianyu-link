@@ -7,6 +7,9 @@ from datetime import datetime
 from pathlib import Path
 import base64, io, json, os, re, subprocess, sys, shutil, tempfile, urllib.request
 
+VERSION = "3.2"   # keep in sync with the header line above
+REPO    = "https://github.com/pierro78/xianyu-link"
+
 PACKAGE = "com.taobao.idlefish"
 
 ITEM_ID_RE      = re.compile(r"fleamarket://awesome_detail\?itemId=(\d{9,})")
@@ -807,6 +810,7 @@ def get_current_target():
 def watch_mode():
     import threading, queue, time
     pid = get_pid()
+    print(f"xianyu-link V{VERSION} — {REPO}")
     print(f"Device:  {DEVICE}")
     print(f"Logs:    {log_stats()}")
     print(f"         {PURGE_HINT}")
@@ -949,7 +953,9 @@ def main():
             except Exception:
                 pass
     global CROP_TOP, CROP_BOTTOM
-    ap = argparse.ArgumentParser(description="Extract Xianyu item/seller URLs via ADB.")
+    ap = argparse.ArgumentParser(description=f"xianyu-link V{VERSION} — extract Xianyu item/seller URLs via ADB.",
+                                 epilog=f"Info and updates: {REPO}")
+    ap.add_argument("-V", "--version", action="version", version=f"xianyu-link V{VERSION}")
     ap.add_argument("-w", "--watch", action="store_true", help="watch continuously")
     ap.add_argument("--last", type=int, metavar="N",
                     help="browse history from the Nth most recent entry (0 = latest): ↑ older, ↓ newer, s split, q quit")
