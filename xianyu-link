@@ -23,8 +23,8 @@ SHOTS_DIR = LOG_FILE.parent / "shots"   # one unsplit screenshot per item: <item
 TMP_DIR  = tempfile.gettempdir()   # /tmp on Linux, %TEMP% on Windows
 WINDOWS  = os.name == "nt"
 
-# ── Phone-specific settings (tuned for Huawei Mate 20 X, 720x1496) ───────────
-CROP_TOP         = 7     # % of screen height cut at the top (status bar)   — override: --top N
+# ── Phone-specific settings (tuned for 2560x1600 8.8" tablet, portrait mode) ──
+CROP_TOP         = 5     # % of screen height cut at the top (status bar)   — override: --top N
 CROP_BOTTOM      = 95    # % of screen height kept down to (nav buttons)     — override: --bottom N
 SCREENSHOT_DELAY = 3     # s between item detection and screen capture
 PAGE_LOAD_DELAY  = 1.5   # s to wait before reading the price from the screen
@@ -76,13 +76,11 @@ def copy_to_clipboard(text):
     if shutil.which("xclip"):
         subprocess.run(["xclip", "-selection", "clipboard"],
                        input=text.encode(), check=False); return "xclip"
-    if shutil.which("pbcopy"):   # macOS
-        subprocess.run(["pbcopy"], input=text.encode(), check=False); return "pbcopy"
-
-
     if WINDOWS:
         subprocess.run(["clip"], input=text.encode(), check=False)   # URLs are ASCII
         return "clip"
+    if shutil.which("pbcopy"):   # macOS
+        subprocess.run(["pbcopy"], input=text.encode(), check=False); return "pbcopy"
     return None
 
 
