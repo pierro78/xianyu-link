@@ -15,7 +15,7 @@ It removes the login box and its overlay, re-enables scrolling, and removes the 
 
 ## Versions
 
-V3.2 : seller info (rating, credit, on sale, IP province, last online, shop badge) + seller screenshot ; "?" when shop/individual is a guess ; fixes: item shown after leaving it, Xianyu restart, revisited sellers
+V3.2 : seller info (rating, credit, on sale, IP province, last online, shop badge) + seller screenshot ; "?" when shop/individual is a guess ; --last: + / - to zoom the screenshot (0 = reset) ; fixes: item shown after leaving it, Xianyu restart, revisited sellers
 
 V3.1 : pbcopy (macOS)
 
