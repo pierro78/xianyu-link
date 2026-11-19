@@ -372,7 +372,7 @@ def _screenshot_crop(delay=SCREENSHOT_DELAY, item_id=None):
         return None
 
 
-def show_mainpic(url):
+def show_mainpic(url, width=MAINPIC_WIDTH):
     try:
         if url.startswith("//"):
             url = "https:" + url
@@ -383,7 +383,7 @@ def show_mainpic(url):
         img.thumbnail((800, 800))
         tmp = os.path.join(TMP_DIR, "xianyu_mainpic.jpg")
         img.save(tmp, "JPEG", quality=85)
-        _imgcat(tmp)
+        _imgcat(tmp, width)
     except Exception as e:
         print(f"         (image download failed: {e})", file=sys.stderr)
 
@@ -415,25 +415,31 @@ def _load_history():
         die(f"no history yet ({LOG_FILE})")
 
 
-def show_entry(info, split, copy=True):
+def _zoomed(width, zoom):
+    """'40%' × 1.25 → '50%' (max 100%)."""
+    return f"{min(100, round(float(width.rstrip('%')) * zoom))}%"
+
+
+def show_entry(info, split, copy=True, zoom=1.0):
+    split_w, single_w = _zoomed(SCREENSHOT_WIDTH, zoom), _zoomed(MAINPIC_WIDTH, zoom)
     clip = copy_to_clipboard(info["url"]) if copy else None
     clip_note = f"  → copied ({clip})" if clip else ""
     print(f"[{info['type']}]".ljust(9) + f"{info['url']}{clip_note}")
     print_details(info, device=True)
     shot = info.get("screenshot")
     if info["type"] == "seller" and shot and os.path.exists(shot) and sys.stdout.isatty():
-        _imgcat(_split_halves(shot), SCREENSHOT_WIDTH) if split else _imgcat(shot, MAINPIC_WIDTH)
+        _imgcat(_split_halves(shot), split_w) if split else _imgcat(shot, single_w)
     if info["type"] == "item":
         if not sys.stdout.isatty():
             pass   # no inline images when piped
         elif shot and os.path.exists(shot):
             if split:
-                _imgcat(_split_halves(shot), SCREENSHOT_WIDTH)
+                _imgcat(_split_halves(shot), split_w)
             else:
-                _imgcat(shot, MAINPIC_WIDTH)
+                _imgcat(shot, single_w)
         elif info.get("image"):
             print("         (no screenshot saved, showing CDN image)")
-            show_mainpic(info["image"])
+            show_mainpic(info["image"], single_w)
         else:
             print("         (no screenshot saved for this entry)")
     print(flush=True)
@@ -517,7 +523,7 @@ def _read_key():
 
 def show_last(n, split):
     """--last N: browse history starting at the Nth most recent entry (0 = latest).
-    ↑ = older (N+1), ↓ = newer (N-1), s = split on/off, q = quit.
+    ↑ = older (N+1), ↓ = newer (N-1), s = split on/off, + / - = zoom, 0 = reset zoom, q = quit.
     In split mode, 2 entries are shown (N, then N+1 below); the URL copied is N's."""
     entries = _load_history()
     if not 0 <= n < len(entries):
@@ -525,17 +531,20 @@ def show_last(n, split):
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         show_entry(entries[-1 - n], split)
         return
+    zoom  = 1.0
+    ZOOMS = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0)
     try:
         while True:
             sys.stdout.write("\033[2J\033[3J\033[H")   # clear screen + scrollback
             pair = split and n + 1 < len(entries)
             label = f"--last {n}" + (f" + {n + 1}" if pair else "")
             print(f"{label}   ({n + 1}/{len(entries)})\n")
-            show_entry(entries[-1 - n], split)
+            show_entry(entries[-1 - n], split, zoom=zoom)
             if pair:
                 print("─" * 60 + f"  --last {n + 1}\n")
-                show_entry(entries[-2 - n], split, copy=False)
-            print(f"↑ older   ↓ newer   s split {'off' if split else 'on'}   q quit", flush=True)
+                show_entry(entries[-2 - n], split, copy=False, zoom=zoom)
+            print(f"↑ older   ↓ newer   s split {'off' if split else 'on'}   "
+                  f"+ / - zoom ({round(zoom * 100)}%)   q quit", flush=True)
             while True:
                 k = _read_key()
                 if k in ("q", "Q", "esc", "\x1b", "\x03"):   # \x1b = Esc on Windows (msvcrt)
@@ -546,6 +555,16 @@ def show_last(n, split):
                     n -= 1; break
                 if k in ("s", "S"):
                     split = not split; break
+                if k in ("+", "="):   # '=' = same key without Shift (QWERTY / AZERTY)
+                    bigger = [z for z in ZOOMS if z > zoom]
+                    if bigger:
+                        zoom = bigger[0]; break
+                if k in ("-", "_"):
+                    smaller = [z for z in ZOOMS if z < zoom]
+                    if smaller:
+                        zoom = smaller[-1]; break
+                if k == "0" and zoom != 1.0:
+                    zoom = 1.0; break
     except KeyboardInterrupt:
         pass
     finally:
